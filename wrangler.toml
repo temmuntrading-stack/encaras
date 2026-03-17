@@ -1,0 +1,9 @@
+name = "mongolhub-cars"
+compatibility_date = "2024-03-12"
+compatibility_flags = ["nodejs_compat"]
+pages_build_output_dir = ".vercel/output/static"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mongolhub-cars-db"
+database_id = "00000000-0000-0000-0000-000000000000" # Replace after creating DB in dash
