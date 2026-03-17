@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { translate, translateTextContaining } from '@/lib/translator';
-import puppeteer from 'puppeteer-core';
-import fs from 'fs';
+import * as cheerio from 'cheerio';
 
 // ─────────────────────────────────────────────────────────────────────
 // Types
@@ -38,220 +37,136 @@ function extractEncarId(url: string): string | null {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Scrape using Puppeteer to bypass JS bot protection
+// Scrape using fetch + cheerio (works on Cloudflare Workers)
 // ─────────────────────────────────────────────────────────────────────
-async function scrapeWithPuppeteer(carId: string) {
-  const executablePaths = [
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    '/usr/bin/google-chrome',
-    '/opt/google/chrome/chrome'
-  ];
-  
-  let browser;
-  for (const p of executablePaths) {
-    if (fs.existsSync(p)) {
-      try {
-        browser = await puppeteer.launch({ 
-          executablePath: p, 
-          headless: true, // changed from 'new' to true for TS compatibility
-          args: ['--no-sandbox', '--disable-setuid-sandbox']
-        });
-        break;
-      } catch (e) {
-        // ignore and try next
+async function scrapeWithFetch(carId: string) {
+  const url = `https://fem.encar.com/cars/detail/${carId}`;
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'ko-KR,ko;q=0.9',
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`Encar returned status ${res.status}`);
+  }
+
+  const html = await res.text();
+  const $ = cheerio.load(html);
+
+  // Remove scripts/styles for clean text extraction
+  $('script').remove();
+  $('style').remove();
+  $('noscript').remove();
+
+  const bodyText = $('body').text();
+
+  // Parse specs using regex on the full text
+  let title = '';
+  let year = '';
+  let mileage = '';
+  let fuel = '';
+  const transmission = '오토';
+  const color = '';
+  let price_krw = 0;
+
+  // Title: appears before 연식 pattern
+  const titleMatch = bodyText.match(/(?:사진 모두보기|제휴사 소개)([^연]+?)연식/);
+  if (titleMatch) {
+    title = titleMatch[1].trim();
+  }
+
+  // Year
+  const yearMatch = bodyText.match(/연식\s*(\d{2}\/\d{2}식(?:\s*\(\d+년형\))?)/);
+  if (yearMatch) year = yearMatch[1].trim();
+
+  // Mileage
+  const mileageMatch = bodyText.match(/주행거리\s*([0-9,]+km)/);
+  if (mileageMatch) mileage = mileageMatch[1];
+
+  // Fuel
+  const fuelMatch = bodyText.match(/연료\s*(가솔린|디젤|LPG|하이브리드|전기|수소)/);
+  if (fuelMatch) fuel = fuelMatch[1];
+
+  // Price: look for NNN만원 pattern near end of text
+  const priceMatches = bodyText.match(/(\d{1,4},?\d{0,3})만원/g);
+  if (priceMatches) {
+    // The car price is usually the last standalone price before 총비용계산기
+    const beforeCalc = bodyText.split('총비용계산기')[0];
+    const lastPriceMatch = beforeCalc.match(/(\d{1,4},?\d{0,3})만원/g);
+    if (lastPriceMatch) {
+      const lastPrice = lastPriceMatch[lastPriceMatch.length - 1];
+      const v = parseInt(lastPrice.replace(/[^0-9]/g, ''), 10);
+      if (v > 0) price_krw = v * 10000;
+    }
+  }
+
+  // Options: extract from text between 주요옵션 and (차량 상태 or 렌트 정보)
+  const options: string[] = [];
+  const optSection = bodyText.match(/주요옵션.*?옵션 설명 보기(.*?)(?:\d+개 옵션 모두보기|차량 상태|렌트 정보|차량이력)/s);
+  if (optSection) {
+    const optText = optSection[1];
+    // Pattern: "옵션명 있음" or "옵션명 없음"
+    const optPairs = optText.match(/([^\s있없]+(?:\s*\([^)]+\))?)\s*(있음|없음)/g);
+    if (optPairs) {
+      for (const pair of optPairs) {
+        if (pair.endsWith('있음')) {
+          const optName = pair.replace(/\s*있음$/, '').trim();
+          if (optName && optName !== '옵션 설명 보기') {
+            options.push(optName);
+          }
+        }
       }
     }
   }
 
-  if (!browser) {
-    throw new Error('서버에 브라우저(Chrome/Edge)가 설치되어 있지 않습니다.');
+  // Accident history
+  let myCarDamage = '';
+  let otherCarDamage = '';
+  const myDamageMatch = bodyText.match(/내차 피해\s*(총\s*[0-9,]+원\s*\(\d+회\)|없음)/);
+  if (myDamageMatch) myCarDamage = myDamageMatch[1].trim();
+  const otherDamageMatch = bodyText.match(/타차 가해\s*(총\s*[0-9,]+원\s*\(\d+회\)|없음)/);
+  if (otherDamageMatch) otherCarDamage = otherDamageMatch[1].trim();
+
+  // Frame / exterior status
+  let frameStatus = '';
+  let exteriorStatus = '';
+  if (bodyText.includes('프레임')) {
+    if (bodyText.includes('무사고')) frameStatus = '무사고';
+    else if (bodyText.match(/프레임.*정상/)) frameStatus = '정상';
+    else if (bodyText.match(/프레임.*교환/)) frameStatus = '교환';
   }
 
-  try {
-    const page = await browser.newPage();
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': 'ko-KR,ko;q=0.9',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    });
-    
-    // Use the mobile site as it doesn't redirect headless browsers as strictly
-    const url = `https://fem.encar.com/cars/detail/${carId}`;
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-    
-    // Wait explicitly for the price or options to appear, or max 3 seconds
-    try {
-       await page.waitForFunction(() => {
-          return document.body.innerText.includes('만원') || document.body.innerText.includes('주요옵션');
-       }, { timeout: 3000 });
-    } catch(e) { /* ignore timeout */ }
-    
-    // Additional pause to ensure CSR finishes rendering everything
-    await new Promise(r => setTimeout(r, 2000));
-    
-    const data = await page.evaluate((carId) => {
-      // 1. Text parsing for specs & price
-      const text = document.body.innerText;
-      const lines = text.split('\n').map(l => l.trim()).filter(l => l);
-      
-      let year = '', mileage = '', fuel = '', transmission = '오토', color = '';
-      let price_krw = 0;
-      let title = '';
-      
-      for (let i = 0; i < lines.length; i++) {
-         const line = lines[i];
-         
-         // Price 
-         if (line.match(/^[0-9,]+만?원$/)) {
-             const v = parseInt(line.replace(/[^0-9]/g, ''), 10);
-             if (v > 0 && price_krw === 0) price_krw = line.includes('만') ? v * 10000 : v;
-         } else if (line.match(/^[0-9,]+$/) && lines[i+1] === '만원') {
-             const v = parseInt(line.replace(/[^0-9]/g, ''), 10);
-             if (v > 0 && price_krw === 0) price_krw = v * 10000;
-         }
-         
-         // Specs
-         if (line.includes('연식') && lines[i+1] && lines[i+1].match(/[0-9]{2}\/[0-9]{2}식/)) year = lines[i+1];
-         else if (line.match(/^[0-9]{2}\/[0-9]{2}식/)) year = line;
-         
-         if (line.includes('주행거리') && lines[i+1] && lines[i+1].includes('km')) mileage = lines[i+1];
-         else if (line.match(/^[0-9,]+km$/i)) mileage = line;
-         
-         if (line === '연료' && lines[i+1] && lines[i+1].match(/가솔린|디젤|LPG|하이브리드|전기|수소/)) fuel = lines[i+1];
-         else if (line.match(/^(가솔린|디젤|LPG|하이브리드|전기|수소)$/)) fuel = line;
-         
-         // Title is usually a few lines before '연식' and has vehicle name length.
-         // We can find it by looking backwards from '연식'
-         if ((line.includes('연식') || line.match(/^[0-9]{2}\/[0-9]{2}식/)) && !title) {
-            // go back a few lines
-            for (let j = 1; j <= 5; j++) {
-               if (i-j >= 0 && lines[i-j].length > 4 && !lines[i-j].includes('사진') && !lines[i-j].includes('이전이미지')) {
-                  title = lines[i-j];
-                  break;
-               }
-            }
-         }
-      }
-
-      // Options
-      const options: string[] = [];
-      document.querySelectorAll('.list_option li').forEach(li => {
-         const optName = li.querySelector('.name');
-         if (optName && optName.textContent) {
-            options.push(optName.textContent.trim());
-         }
-      });
-      // Fallback for options if different structure
-      if (options.length === 0) {
-         document.querySelectorAll('.cars_option li, .box_opt li').forEach(el => {
-            if (el.textContent) options.push(el.textContent.trim());
-         });
-         
-         if (options.length === 0) {
-           const dts = Array.from(document.querySelectorAll('dt'));
-           const optDt = dts.find(d => d.textContent?.includes('주요옵션'));
-           if (optDt && optDt.nextElementSibling) {
-              optDt.nextElementSibling.querySelectorAll('span').forEach(span => {
-                 if (span.textContent) options.push(span.textContent.trim());
-              });
-           }
-         }
-      }
-
-      // Text fallback
-      if (options.length === 0) {
-         const optStartIdx = lines.findIndex(l => l.includes('주요옵션'));
-         if (optStartIdx !== -1) {
-            for (let i = optStartIdx + 1; i < lines.length; i++) {
-                if (lines[i] === '차량 상태' || lines[i] === '차량이력' || lines[i].includes('옵션 모두보기')) break;
-                if (lines[i] === '있음' && lines[i-1]) {
-                    let optName = lines[i-1];
-                    if (optName.startsWith('(') && lines[i-2]) {
-                       optName = lines[i-2] + ' ' + optName;
-                    }
-                    if (optName !== '옵션 설명 보기') {
-                       options.push(optName);
-                    }
-                }
-            }
-         }
-      }
-
-      // Diagnosis (Frame/Exterior)
-      let frameStatus = '', exteriorStatus = '';
-      const diagWrap = document.querySelector('.wrap_diagnosis, .box_health');
-      if (diagWrap) {
-         const rows = diagWrap.querySelectorAll('dl, li, tr');
-         rows.forEach(row => {
-            const text = row.textContent || '';
-            if (text.includes('프레임')) {
-               if (text.includes('정상')) frameStatus = '정상';
-               else if (text.includes('교환')) frameStatus = '교환';
-            }
-            if (text.includes('외부패널')) {
-               if (text.includes('정상')) exteriorStatus = '정상';
-               else if (text.includes('교환')) exteriorStatus = '교환';
-               else if (text.includes('판금')) exteriorStatus = '판금';
-            }
-         });
-      }
-
-      // Accident History
-      let myCarDamage = '', otherCarDamage = '';
-      const historyWrap = document.querySelector('.wrap_history, .box_history');
-      if (historyWrap) {
-         const texts = Array.from(historyWrap.querySelectorAll('dt, dd, span, p')).map(e => e.textContent || '');
-         for (let i = 0; i < texts.length; i++) {
-            if (texts[i].includes('내차 피해') && texts[i+1]) myCarDamage = texts[i+1].trim();
-            if (texts[i].includes('타차 가해') && texts[i+1]) otherCarDamage = texts[i+1].trim();
-         }
-      }
-
-      // Fallback history text search
-      if (!myCarDamage && text.includes('내차 피해')) {
-         const m = text.match(/내차 피해\s*(총[^원]+원[^)]+\)|없음|[0-9,]+원)/);
-         if (m) myCarDamage = m[1];
-      }
-      if (!otherCarDamage && text.includes('타차 가해')) {
-         const m = text.match(/타차 가해\s*(총[^원]+원[^)]+\)|없음|[0-9,]+원)/);
-         if (m) otherCarDamage = m[1];
-      }
-
-      // Images
-      const imgUrls: string[] = [];
-      Array.from(document.querySelectorAll('img')).forEach(img => {
-        const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
-        if (src && (src.includes('ci.encar.com') || src.includes('image.encar.com')) && !src.includes('logo') && !src.includes('icon')) {
-          imgUrls.push(src);
-        }
-      });
-      const uniqueImgs = Array.from(new Set(imgUrls));
-      if (uniqueImgs.length === 0) {
-         uniqueImgs.push(`https://ci.encar.com/carpicture${carId}/001.jpg`);
-      }
-
-      return {
-        title: title || `엔카 차량 #${carId}`,
-        price_krw,
-        year,
-        mileage,
-        fuel,
-        transmission,
-        color,
-        options,
-        frameStatus,
-        exteriorStatus,
-        myCarDamage,
-        otherCarDamage,
-        imageUrls: uniqueImgs.slice(0, 10)
-      };
-    }, carId);
-
-    console.log('--- Puppeteer Extracted Data ---', data);
-    return data;
-  } finally {
-    await browser.close();
+  // Images
+  const imgUrls: string[] = [];
+  $('img').each((_, el) => {
+    const src = $(el).attr('src') || $(el).attr('data-src') || '';
+    if (src && (src.includes('ci.encar.com') || src.includes('image.encar.com')) && !src.includes('logo') && !src.includes('icon')) {
+      imgUrls.push(src.startsWith('//') ? `https:${src}` : src);
+    }
+  });
+  const uniqueImgs = [...new Set(imgUrls)];
+  if (uniqueImgs.length === 0) {
+    uniqueImgs.push(`https://ci.encar.com/carpicture/carpicture${carId.substring(0, 2)}/pic${carId.substring(0, 4)}/${carId}_001.jpg`);
   }
+
+  return {
+    title: title || `엔카 차량 #${carId}`,
+    price_krw,
+    year,
+    mileage,
+    fuel,
+    transmission,
+    color,
+    options,
+    frameStatus,
+    exteriorStatus,
+    myCarDamage,
+    otherCarDamage,
+    imageUrls: uniqueImgs.slice(0, 10),
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -262,7 +177,7 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const rawUrl: string = body?.url ?? '';
 
-    if (!rawUrl.includes('encar.com')) {
+    if (!rawUrl.includes('encar.com') && !rawUrl.match(/\d{7,}/)) {
       return NextResponse.json({ error: '엔카 URL만 지원됩니다.' }, { status: 400 });
     }
 
@@ -271,8 +186,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'URL에서 차량 ID를 찾을 수 없습니다.' }, { status: 400 });
     }
 
-    // Attempt Scraping
-    const parsed = await scrapeWithPuppeteer(carId);
+    const parsed = await scrapeWithFetch(carId);
 
     if (!parsed || !parsed.title) {
       return NextResponse.json({ error: '데이터를 가져오지 못했습니다. (판매 완료 또는 봇 차단)' }, { status: 502 });
@@ -293,7 +207,7 @@ export async function POST(request: NextRequest) {
       frame_status: translate(parsed.frameStatus || ''),
       exterior_status: translate(parsed.exteriorStatus || ''),
       my_car_damage: translate(parsed.myCarDamage || ''),
-      other_car_damage: translate(parsed.otherCarDamage || '')
+      other_car_damage: translate(parsed.otherCarDamage || ''),
     };
 
     return NextResponse.json({ car });
