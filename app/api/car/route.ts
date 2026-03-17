@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { translate, translateTextContaining } from '@/lib/translator';
-import * as cheerio from 'cheerio';
 
 // ─────────────────────────────────────────────────────────────────────
 // Types
@@ -37,10 +36,45 @@ function extractEncarId(url: string): string | null {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Scrape using fetch + cheerio (works on Cloudflare Workers)
+// Remove HTML tags from a string
+// ─────────────────────────────────────────────────────────────────────
+function stripHtml(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#\d+;/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Extract image URLs from HTML using regex
+// ─────────────────────────────────────────────────────────────────────
+function extractImages(html: string): string[] {
+  const imgRegex = /(?:src|data-src)=["']([^"']*(?:ci\.encar\.com|image\.encar\.com)[^"']*)/gi;
+  const urls: string[] = [];
+  let match;
+  while ((match = imgRegex.exec(html)) !== null) {
+    let src = match[1];
+    if (src && !src.includes('logo') && !src.includes('icon')) {
+      if (src.startsWith('//')) src = 'https:' + src;
+      if (urls.indexOf(src) === -1) urls.push(src);
+    }
+  }
+  return urls;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Scrape using fetch + regex (works on Cloudflare Workers)
 // ─────────────────────────────────────────────────────────────────────
 async function scrapeWithFetch(carId: string) {
-  const url = `https://fem.encar.com/cars/detail/${carId}`;
+  const url = 'https://fem.encar.com/cars/detail/' + carId;
   const res = await fetch(url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -50,20 +84,13 @@ async function scrapeWithFetch(carId: string) {
   });
 
   if (!res.ok) {
-    throw new Error(`Encar returned status ${res.status}`);
+    throw new Error('Encar returned status ' + res.status);
   }
 
   const html = await res.text();
-  const $ = cheerio.load(html);
+  const bodyText = stripHtml(html);
 
-  // Remove scripts/styles for clean text extraction
-  $('script').remove();
-  $('style').remove();
-  $('noscript').remove();
-
-  const bodyText = $('body').text();
-
-  // Parse specs using regex on the full text
+  // Parse specs using regex on the clean text
   let title = '';
   let year = '';
   let mileage = '';
@@ -72,8 +99,8 @@ async function scrapeWithFetch(carId: string) {
   const color = '';
   let price_krw = 0;
 
-  // Title: appears before 연식 pattern
-  const titleMatch = bodyText.match(/(?:사진 모두보기|제휴사 소개)([^연]+?)연식/);
+  // Title: text between "사진 모두보기" and "연식"
+  const titleMatch = bodyText.match(/사진 모두보기\s+(.+?)\s+연식/);
   if (titleMatch) {
     title = titleMatch[1].trim();
   }
@@ -90,33 +117,26 @@ async function scrapeWithFetch(carId: string) {
   const fuelMatch = bodyText.match(/연료\s*(가솔린|디젤|LPG|하이브리드|전기|수소)/);
   if (fuelMatch) fuel = fuelMatch[1];
 
-  // Price: look for NNN만원 pattern near end of text
-  const priceMatches = bodyText.match(/(\d{1,4},?\d{0,3})만원/g);
+  // Price: look for NNN만원 pattern before 총비용계산기
+  const beforeCalc = bodyText.split('총비용계산기')[0] || bodyText;
+  const priceMatches = beforeCalc.match(/(\d{1,4},?\d{0,3})만원/g);
   if (priceMatches) {
-    // The car price is usually the last standalone price before 총비용계산기
-    const beforeCalc = bodyText.split('총비용계산기')[0];
-    const lastPriceMatch = beforeCalc.match(/(\d{1,4},?\d{0,3})만원/g);
-    if (lastPriceMatch) {
-      const lastPrice = lastPriceMatch[lastPriceMatch.length - 1];
-      const v = parseInt(lastPrice.replace(/[^0-9]/g, ''), 10);
-      if (v > 0) price_krw = v * 10000;
-    }
+    const lastPrice = priceMatches[priceMatches.length - 1];
+    const v = parseInt(lastPrice.replace(/[^0-9]/g, ''), 10);
+    if (v > 0) price_krw = v * 10000;
   }
 
-  // Options: extract from text between 주요옵션 and (차량 상태 or 렌트 정보)
+  // Options: extract "옵션명 있음" patterns from the options section
   const options: string[] = [];
-  const optSection = bodyText.match(/주요옵션[\s\S]*?옵션 설명 보기([\s\S]*?)(?:\d+개 옵션 모두보기|차량 상태|렌트 정보|차량이력)/);
+  const optSection = bodyText.match(/옵션 설명 보기([\s\S]*?)(?:\d+개 옵션 모두보기|차량 상태|렌트 정보|차량이력)/);
   if (optSection) {
     const optText = optSection[1];
-    // Pattern: "옵션명 있음" or "옵션명 없음"
-    const optPairs = optText.match(/([^\s있없]+(?:\s*\([^)]+\))?)\s*(있음|없음)/g);
+    const optPairs = optText.match(/([^\s]+(?:\s*\([^)]+\))?)\s+있음/g);
     if (optPairs) {
-      for (const pair of optPairs) {
-        if (pair.endsWith('있음')) {
-          const optName = pair.replace(/\s*있음$/, '').trim();
-          if (optName && optName !== '옵션 설명 보기') {
-            options.push(optName);
-          }
+      for (let i = 0; i < optPairs.length; i++) {
+        const optName = optPairs[i].replace(/\s+있음$/, '').trim();
+        if (optName && optName !== '옵션 설명 보기') {
+          options.push(optName);
         }
       }
     }
@@ -130,30 +150,18 @@ async function scrapeWithFetch(carId: string) {
   const otherDamageMatch = bodyText.match(/타차 가해\s*(총\s*[0-9,]+원\s*\(\d+회\)|없음)/);
   if (otherDamageMatch) otherCarDamage = otherDamageMatch[1].trim();
 
-  // Frame / exterior status
+  // Frame status
   let frameStatus = '';
-  let exteriorStatus = '';
-  if (bodyText.includes('프레임')) {
-    if (bodyText.includes('무사고')) frameStatus = '무사고';
-    else if (bodyText.match(/프레임.*정상/)) frameStatus = '정상';
-    else if (bodyText.match(/프레임.*교환/)) frameStatus = '교환';
-  }
+  if (bodyText.includes('프레임') && bodyText.includes('무사고')) frameStatus = '무사고';
 
-  // Images
-  const imgUrls: string[] = [];
-  $('img').each((_, el) => {
-    const src = $(el).attr('src') || $(el).attr('data-src') || '';
-    if (src && (src.includes('ci.encar.com') || src.includes('image.encar.com')) && !src.includes('logo') && !src.includes('icon')) {
-      imgUrls.push(src.startsWith('//') ? `https:${src}` : src);
-    }
-  });
-  const uniqueImgs = Array.from(new Set(imgUrls));
-  if (uniqueImgs.length === 0) {
-    uniqueImgs.push(`https://ci.encar.com/carpicture/carpicture${carId.substring(0, 2)}/pic${carId.substring(0, 4)}/${carId}_001.jpg`);
+  // Images from HTML
+  const imageUrls = extractImages(html);
+  if (imageUrls.length === 0) {
+    imageUrls.push('https://ci.encar.com/carpicture/carpicture' + carId.substring(0, 2) + '/pic' + carId.substring(0, 4) + '/' + carId + '_001.jpg');
   }
 
   return {
-    title: title || `엔카 차량 #${carId}`,
+    title: title || ('엔카 차량 #' + carId),
     price_krw,
     year,
     mileage,
@@ -162,10 +170,9 @@ async function scrapeWithFetch(carId: string) {
     color,
     options,
     frameStatus,
-    exteriorStatus,
     myCarDamage,
     otherCarDamage,
-    imageUrls: uniqueImgs.slice(0, 10),
+    imageUrls: imageUrls.slice(0, 10),
   };
 }
 
@@ -189,13 +196,18 @@ export async function POST(request: NextRequest) {
     const parsed = await scrapeWithFetch(carId);
 
     if (!parsed || !parsed.title) {
-      return NextResponse.json({ error: '데이터를 가져오지 못했습니다. (판매 완료 또는 봇 차단)' }, { status: 502 });
+      return NextResponse.json({ error: '데이터를 가져오지 못했습니다.' }, { status: 502 });
+    }
+
+    const translatedOptions = [];
+    for (let i = 0; i < (parsed.options || []).length; i++) {
+      translatedOptions.push(translate(parsed.options[i]));
     }
 
     const car: CarRecord = {
       id: carId,
-      url: `https://fem.encar.com/cars/detail/${carId}`,
-      title: translateTextContaining(parsed.title) || `엔카 차량 #${carId}`,
+      url: 'https://fem.encar.com/cars/detail/' + carId,
+      title: translateTextContaining(parsed.title) || ('엔카 차량 #' + carId),
       year: parsed.year,
       mileage: parsed.mileage.replace('km', ' км').replace('만km', '만 км'),
       fuel: translate(parsed.fuel),
@@ -203,9 +215,9 @@ export async function POST(request: NextRequest) {
       color: translate(parsed.color),
       price_krw: parsed.price_krw,
       image_urls: JSON.stringify(parsed.imageUrls),
-      options: JSON.stringify((parsed.options || []).map(o => translate(o))),
+      options: JSON.stringify(translatedOptions),
       frame_status: translate(parsed.frameStatus || ''),
-      exterior_status: translate(parsed.exteriorStatus || ''),
+      exterior_status: '',
       my_car_damage: translate(parsed.myCarDamage || ''),
       other_car_damage: translate(parsed.otherCarDamage || ''),
     };
