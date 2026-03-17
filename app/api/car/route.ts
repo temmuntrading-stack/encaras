@@ -105,7 +105,7 @@ async function scrapeWithFetch(carId: string) {
 
   // Options: extract from text between 주요옵션 and (차량 상태 or 렌트 정보)
   const options: string[] = [];
-  const optSection = bodyText.match(/주요옵션.*?옵션 설명 보기(.*?)(?:\d+개 옵션 모두보기|차량 상태|렌트 정보|차량이력)/s);
+  const optSection = bodyText.match(/주요옵션[\s\S]*?옵션 설명 보기([\s\S]*?)(?:\d+개 옵션 모두보기|차량 상태|렌트 정보|차량이력)/);
   if (optSection) {
     const optText = optSection[1];
     // Pattern: "옵션명 있음" or "옵션명 없음"
@@ -147,7 +147,7 @@ async function scrapeWithFetch(carId: string) {
       imgUrls.push(src.startsWith('//') ? `https:${src}` : src);
     }
   });
-  const uniqueImgs = [...new Set(imgUrls)];
+  const uniqueImgs = Array.from(new Set(imgUrls));
   if (uniqueImgs.length === 0) {
     uniqueImgs.push(`https://ci.encar.com/carpicture/carpicture${carId.substring(0, 2)}/pic${carId.substring(0, 4)}/${carId}_001.jpg`);
   }
