@@ -6,12 +6,16 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "build:worker": "opennextjs-cloudflare",
+    "deploy": "npm run build:worker && wrangler deploy",
+    "preview": "npm run build:worker && wrangler dev"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@opennextjs/cloudflare": "^1.17.1",
     "@tailwindcss/postcss": "^4.2.1",
     "axios": "^1.13.6",
     "cheerio": "^1.2.0",
